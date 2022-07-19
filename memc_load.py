@@ -7,19 +7,14 @@ import glob
 import logging
 import collections
 from optparse import OptionParser
-# brew install protobuf
-# protoc  --python_out=. ./appsinstalled.proto
-# pip install protobuf
 import appsinstalled_pb2
-# pip install python-memcached
-import memcache
-
 from multiprocessing import Queue, Process, Array, current_process
 from itertools import islice
+from memcache_connect import memc_set
 
 NORMAL_ERR_RATE = 0.01
 BATCH_SIZE = 10000
-PARSERS_NUM = 2
+PARSERS_NUM = 4
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
@@ -36,21 +31,19 @@ def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
     key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
     ua.apps.extend(appsinstalled.apps)
     packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
     try:
         if dry_run:
-            logging.info("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
+            logging.info(f"{memc_addr} - {key}")
         else:
-            MemCacheConnections().get_client(memc_addr).set(key, packed)
+            memc_set(memc_addr, key, packed)
     except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
+        logging.exception(f"Cannot write to memc {memc_addr}: {e}")
         return False
     return True
 
 
 def parse_appsinstalled(line):
-    # line = line.decode()
+
     line_parts = line.strip().split("\t")
     if len(line_parts) < 5:
         return
@@ -61,16 +54,16 @@ def parse_appsinstalled(line):
         apps = [int(a.strip()) for a in raw_apps.split(",")]
     except ValueError:
         apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
-        logging.info("Not all user apps are digits: `%s`" % line)
+        logging.info(f"Not all user apps are digits: {line}")
     try:
         lat, lon = float(lat), float(lon)
     except ValueError:
-        logging.info("Invalid geo coords: `%s`" % line)
+        logging.info(f"Invalid geo coords: {line}")
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
 def process_gz(file, batch_queue):
-    logging.info('Processing %s' % file)
+    logging.info(f'Processing {file}')
     fd = gzip.open(file, 'rt')
     batch = list(islice(fd, BATCH_SIZE))
     while batch:
@@ -80,7 +73,7 @@ def process_gz(file, batch_queue):
 
 
 def process_batch(batch, device_memc, options):
-    logging.info('Process %s: working on batch' % current_process())
+    logging.info(f'Process {current_process()}: working on batch')
     errors, processed = 0, 0
     for line in batch:
         line = line.strip()
@@ -93,7 +86,7 @@ def process_batch(batch, device_memc, options):
         memc_addr = device_memc.get(appsinstalled.dev_type)
         if not memc_addr:
             errors += 1
-            logging.error("Unknow device type: %s" % appsinstalled.dev_type)
+            logging.error(f"Unknow device type: {appsinstalled.dev_type}")
             continue
         ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry)
         if ok:
@@ -112,18 +105,17 @@ def add_statistic(processed, errors, file,
 
 def parser(batch_queue: Queue, device_memc, options,
            file_stats_processed, file_stats_errors, file_stats_map):
-    #memc_clients = dict((key, memcache.Client([address]))
-    #                    for key, address in device_memc.items())
+
     while 1:
         file, batch = batch_queue.get()
-        logging.info('Process %s: get batch' % current_process())
+        logging.info(f'Process {current_process()}: get batch')
         if not batch:
-            logging.info('Process %s: empty batch, exiting' % current_process())
+            logging.info(f'Process {current_process()}: empty batch, exiting')
             return
         elif batch[0] == 'EOF':
-            logging.info('Process %s: this is EOF batch' % current_process())
-            logging.info('Ending %s' % file)
-            #dot_rename(file)
+            logging.info(f'Process {current_process()}: this is EOF batch')
+            logging.info(f'Ending {file}')
+            dot_rename(file)
         else:
             processed, errors = process_batch(batch, device_memc, options)
             add_statistic(processed, errors, file,
@@ -138,10 +130,9 @@ def show_statistic(file_stats_processed, file_stats_errors, file_stats_map):
             continue
         err_rate = float(errors) / processed
         if err_rate < NORMAL_ERR_RATE:
-            logging.info("File: {}: Acceptable error rate {}. Successfull load".format(file, err_rate))
+            logging.info(f"File: {file}: Acceptable error rate {err_rate}. Successfull load")
         else:
-            logging.error("File: {}: High error rate ({} > {}). Failed load".format(file,
-                                                                                err_rate, NORMAL_ERR_RATE))
+            logging.error(f"File: {file}: High error rate ({err_rate} > {NORMAL_ERR_RATE}). Failed load")
 
 
 def main(options):
@@ -151,10 +142,6 @@ def main(options):
         "adid": options.adid,
         "dvid": options.dvid,
     }
-
-    # Memcached clients
-    #memc_clients = dict((key, memcache.Client([address]))
-    #                    for key, address in device_memc.items())
 
     batch_queue = Queue()
 
@@ -175,7 +162,6 @@ def main(options):
                                          file_stats_map))
         p.start()
         parsers.append(p)
-    #parser(batch_queue, memc_clients, device_memc, options, file_stats_processed, file_stats_errors, file_stats_map)
 
     # Sending batches to Queue
     for file in files:
@@ -214,23 +200,22 @@ if __name__ == '__main__':
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("--dry", action="store_true", default=False)
-    # op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
-    op.add_option("--pattern", action="store", default="/mnt/data/tmp/otuspy/*.tsv.gz")
+    op.add_option("--pattern", action="store", default="data/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     (opts, args) = op.parse_args()
-    logging.basicConfig(#filename=opts.log,
+    logging.basicConfig(filename=opts.log,
                         level=logging.INFO if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
     if opts.test:
         prototest()
         sys.exit(0)
 
-    logging.info("Memc loader started with options: %s" % opts)
+    logging.info(f"Memc loader started with options: {opts}")
     try:
         main(opts)
     except Exception as e:
-        logging.exception("Unexpected error: %s" % e)
+        logging.exception(f"Unexpected error: {e}")
         sys.exit(1)

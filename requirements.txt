@@ -2,3 +2,4 @@ backoff==2.1.2
 protobuf==4.21.2
 pymemcache==3.5.2
 six==1.16.0
+pytest == 7.1.2
